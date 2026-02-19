@@ -1,0 +1,6 @@
+[dotenv@17.3.1] injecting env (3) from .env -- tip: 🔐 prevent committing .env to code: https://dotenvx.com/precommit
+Logged in as SlimTrix Development v1#4539
+Input code: "print(\"hello\""
+Written to: /var/folders/6c/3jr7k2l14txbfmrllzhndx3r0000gn/T/input_1771371439219.lua
+Written content: "print(\"hello\""
+Running obfuscator: lua /Users/slim/Documents/obf-bot-1/Prometheus-discord-bot/lua/cli.lua --preset Strong --LuaU /var/folders/6c/3jr7k2l14txbfmrllzhndx3r0000gn/T/input_1771371439219.lua --out /var/folders/6c/3jr7k2l14txbfmrllzhndx3r0000gn/T/input_1771371439219.obfuscated.lua

@@ -1,0 +1,534 @@
+// Run the obfuscator
+function runObfuscator(inputPath, preset, callback) {
+  const outputPath = inputPath.replace('.lua', '.obfuscated.lua');
+  // Presets in Prometheus are case-sensitive: Weak, Medium, Strong (capitalized)
+  const capitalizedPreset = preset.charAt(0).toUpperCase() + preset.slice(1).toLowerCase();
+  const args = [path.join(OBF_DIR, 'cli.lua'), '--preset', capitalizedPreset, '--LuaU', inputPath, '--out', outputPath];
+
+  console.log('Running obfuscator:', LUA_PATH, args.join(' '));
+
+  const lua = spawn(LUA_PATH, args, {
+    cwd: OBF_DIR,
+    env: { ...process.env, LUA_PATH: `${OBF_DIR}/?.lua;${process.env.LUA_PATH || ''}` },
+  });
+
+  let stdout = '';
+  let stderr = '';
+
+  lua.stdout.on('data', (data) => {
+    stdout += data.toString();
+  });
+
+  lua.stderr.on('data', (data) => {
+    stderr += data.toString();
+  });
+
+  lua.on('close', (code) => {
+    callback(code, stdout, stderr, outputPath);
+  });
+}
+
+// Run the reverse obfuscation script (Node.js)
+function runReverseObfuscation(inputPath, outputPath, callback) {
+  const reverseObfPath = path.join(SRC_DIR, 'deob', 'steps', 'reverseObfuscation.js');
+  const args = ['node', reverseObfPath, inputPath, outputPath];
+
+  console.log('Running reverse obfuscation:', args.join(' '));
+
+  const nodeProcess = spawn('node', args, {
+    cwd: path.dirname(reverseObfPath),
+  });
+
+  let stdout = '';
+  let stderr = '';
+
+  nodeProcess.stdout.on('data', (data) => {
+    stdout += data.toString();
+  });
+
+  nodeProcess.stderr.on('data', (data) => {
+    stderr += data.toString();
+  });
+
+  nodeProcess.on('close', (code) => {
+    callback(code, stdout, stderr);
+  });
+}
+
+// Extract metrics from output
+function parseMetrics(output) {
+  const metrics = [];
+  const lines = output.split('\n');
+  for (const line of lines) {
+    const match = line.match(/\[(.*?)\] lines (\d+) -> (\d+) \(.*?\) funcs.*? strings.*? numbers.*? assigns/);
+    if (match) {
+      metrics.push({
+        name: match[1],
+        linesBefore: parseInt(match[2]),
+        linesAfter: parseInt(match[3]),
+      });
+    }
+  }
+  return metrics;
+}
+
+// Send plain text as .txt file (for simple responses)
+async function sendTextAsFile(msg, content, fileName = 'response.txt') {
+  if (content.length > 8 * 1024 * 1024) {
+    await msg.reply({ content: 'Response too large (exceeds 8MB)' });
+  } else {
+    await msg.reply({
+      files: [new AttachmentBuilder(Buffer.from(content, 'utf8'))
+        .setName(fileName.endsWith('.txt') ? fileName : fileName + '.txt')
+        .setDescription('Text response')]
+    });
+  }
+}
+
+// Extract code from codeblock
+function extractCodeFromMessage(content) {
+  // Match codeblocks with any language or without language
+  const codeBlockMatch = content.match(/```(?:\w+)?\s*([\s\S]*?)```/);
+  if (codeBlockMatch) {
+    return codeBlockMatch[1].trim();
+  }
+  // Check for inline code
+  const inlineMatch = content.match(/`([^`]+)`/);
+  if (inlineMatch) {
+    return inlineMatch[1].trim();
+  }
+  return null;
+}
+
+// Minify Lua code - remove comments and unnecessary whitespace
+function minifyLua(code) {
+  let result = '';
+  let i = 0;
+  let inString = false;
+  let stringChar = '';
+  let escapeNext = false;
+  
+  while (i < code.length) {
+    const char = code[i];
+    
+    // Handle escape sequences
+    if (escapeNext) {
+      result += char;
+      escapeNext = false;
+      i++;
+      continue;
+    }
+    
+    // Check for escape character
+    if (char === '\\' && inString) {
+      result += char;
+      escapeNext = true;
+      i++;
+      continue;
+    }
+    
+    // Check for string start/end
+    if (char === '"' || char === "'") {
+      if (!inString) {
+        inString = true;
+        stringChar = char;
+      } else if (char === stringChar) {
+        inString = false;
+      }
+      result += char;
+      i++;
+      continue;
+    }
+    
+    // Inside string - keep everything
+    if (inString) {
+      result += char;
+      i++;
+      continue;
+    }
+    
+    // Check for multi-line comment: --[[ ... ]]
+    if (char === '-' && code[i + 1] === '-' && code[i + 2] === '[' && code[i + 3] === '[') {
+      // Find the end of multi-line comment
+      const endMatch = code.substring(i).match(/^\-\[\[([\s\S]*?)\]\]/);
+      if (endMatch) {
+        i += endMatch[0].length;
+        continue;
+      }
+    }
+    
+    // Check for single-line comment: --...
+    if (char === '-' && code[i + 1] === '-') {
+      // Check if it's a multi-line comment start
+      if (code[i + 2] === '[' && code[i + 3] === '[') {
+        i += 4;
+        // Find closing ]]
+        let endIdx = code.indexOf(']]', i);
+        if (endIdx !== -1) {
+          i = endIdx + 2;
+          continue;
+        }
+      } else {
+        // Single line comment - skip to end of line
+        while (i < code.length && code[i] !== '\n' && code[i] !== '\r') {
+          i++;
+        }
+        continue;
+      }
+    }
+    
+    // Keep meaningful whitespace (around keywords)
+    if (char === ' ' || char === '\t' || char === '\n' || char === '\r') {
+      // Check if we need space before next char
+      const nextNonSpace = code.substring(i + 1).match(/^[ \t\n\r]*([a-zA-Z0-9_\(\[\{])/);
+      if (nextNonSpace) {
+        // Check if we need space after previous char
+        const prevChar = result.slice(-1);
+        if (prevChar && prevChar.match(/[a-zA-Z0-9_\)\]\}]/)) {
+          result += ' ';
+        }
+      }
+      // Skip multiple whitespace
+      while (i < code.length && (code[i] === ' ' || code[i] === '\t' || code[i] === '\n' || code[i] === '\r')) {
+        i++;
+      }
+      continue;
+    }
+    
+    result += char;
+    i++;
+  }
+  
+  return result;
+}
+
+// Handle deobfuscation request
+async function handleDeobfuscation(msg, luaFile, options) {
+  const tempDir = path.join(__dirname, 'temp');
+  ensureDir(tempDir); // Ensure temp directory exists
+  const tempInput = path.join(tempDir, `input_${msg.id}.lua`);
+  const tempOutput = path.join(tempDir, `output_${msg.id}.lua`);
+  const tempReversedOutput = path.join(tempDir, `reversed_${msg.id}.lua`);
+  const tempAst = path.join(tempDir, `ast_${msg.id}.lua`);
+  const tempSnapshots = path.join(tempDir, `snapshots_${msg.id}`);
+
+  try {
+    // Write uploaded file
+    fs.writeFileSync(tempInput, luaFile);
+
+    const runOptions = {
+      out: tempOutput,
+      trace: options.trace || 'off',
+      pretty: true,
+      emitAst: options.ast ? tempAst : null,
+      emitSnapshots: options.snapshots ? tempSnapshots : null,
+      staticOnly: options.staticOnly,
+    };
+
+    // Filter null values
+    Object.keys(runOptions).forEach(key => {
+      if (runOptions[key] === null) delete runOptions[key];
+    });
+
+    const loadingMsg = await msg.reply(`**Running deobfuscation with trace mode:** \`${runOptions.trace}\`...`);
+
+runDeobfuscator(tempInput, runOptions, async (code, stdout, stderr) => {
+      // Check if output file was created even with error
+      const hasOutput = fs.existsSync(tempOutput);
+      
+      // Don't delete input file - keep it for debugging in temp folder
+      // try { fs.unlinkSync(tempInput); } catch (e) {}
+
+      if (code !== 0 && !hasOutput) {
+        await loadingMsg.edit(`Error running deobfuscator!\n\`\`\`\n${stderr || stdout}\n\`\`\``);
+        return;
+      }
+
+      const metrics = parseMetrics(stdout);
+      const resultEmbed = new EmbedBuilder();
+      resultEmbed.setTitle('Deobfuscation Complete');
+      resultEmbed.setColor(0x00ff00);
+      resultEmbed.addFields({ name: 'Trace Mode', value: `\`${runOptions.trace}\``, inline: true });
+
+      if (metrics.length > 0) {
+        const totalDelta = metrics.reduce((acc, m) => acc + (m.linesAfter - m.linesBefore), 0);
+        resultEmbed.addFields(
+          { name: 'Steps Run', value: metrics.length.toString(), inline: true },
+          { name: 'Total Line Delta', value: `${totalDelta > 0 ? '+' : ''}${totalDelta}`, inline: true }
+        );
+        
+        const stepsText = metrics.map(m => `\`${m.name}\`: ${m.linesBefore} → ${m.linesAfter}`).join('\n');
+        resultEmbed.addFields({ name: 'Pipeline Steps', value: stepsText.substring(0, 1024) });
+      }
+
+      const files = [];
+      
+      // Add the full output (stdout) as a separate txt file
+      if (stdout && stdout.length > 0) {
+        files.push(new AttachmentBuilder(Buffer.from(stdout, 'utf8'))
+          .setName('deobfuscation_output.txt')
+          .setDescription('Full deobfuscation output'));
+      }
+      
+      if (fs.existsSync(tempOutput)) {
+        let outputCode = fs.readFileSync(tempOutput, 'utf8');
+        outputCode = decodeNumericEscapes(outputCode);
+        
+        // Run reverse obfuscation to fully deobfuscate
+        await new Promise((resolve) => {
+          runReverseObfuscation(tempOutput, tempReversedOutput, (revCode, revStdout, revStderr) => {
+            if (revCode === 0 && fs.existsSync(tempReversedOutput)) {
+              // Use the reversed output instead
+              try {
+                outputCode = fs.readFileSync(tempReversedOutput, 'utf8');
+                resultEmbed.addFields({ name: 'Reverse Obfuscation', value: '✅ Applied', inline: true });
+              } catch (e) {
+                console.error('Error reading reversed output:', e);
+                resultEmbed.addFields({ name: 'Reverse Obfuscation', value: '⚠️ Failed', inline: true });
+              }
+            } else {
+              console.log('Reverse obfuscation not applied:', revStderr || revStdout);
+              // Check if the output contains obfuscated characters (non-ASCII > 127)
+              const hasObfuscatedChars = /[\x80-\xff]/.test(outputCode);
+              if (hasObfuscatedChars) {
+                resultEmbed.addFields({ name: 'Reverse Obfuscation', value: '⚠️ Could not reverse', inline: true });
+              }
+            }
+            resolve();
+          });
+        });
+        
+        // Apply minification using the same method as .minify command
+        outputCode = minifyLua(outputCode);
+        resultEmbed.addFields({ name: 'Minified', value: '✅ Yes', inline: true });
+        
+        // Check file size (increased limit for larger scripts)
+        if (outputCode.length > 16 * 1024 * 1024) {
+          resultEmbed.addFields({ name: '**Output too large**', value: 'Output file exceeds 16MB limit' });
+        } else {
+          files.push(new AttachmentBuilder(Buffer.from(outputCode, 'utf8'))
+            .setName('deobfuscated.txt')
+            .setDescription('Deobfuscated Lua code'));
+        }
+        
+        // Cleanup outputs
+        try { fs.unlinkSync(tempOutput); } catch (e) {}
+        try { fs.unlinkSync(tempReversedOutput); } catch (e) {}
+      }
+
+      if (options.ast && fs.existsSync(tempAst)) {
+        const astCode = fs.readFileSync(tempAst, 'utf8');
+        if (astCode.length < 8 * 1024 * 1024) {
+          files.push(new AttachmentBuilder(Buffer.from(astCode, 'utf8'))
+            .setName('ast_output.txt')
+            .setDescription('AST representation'));
+        }
+        try { fs.unlinkSync(tempAst); } catch (e) {}
+      }
+
+      if (options.snapshots && fs.existsSync(tempSnapshots)) {
+        const snapshotFiles = fs.readdirSync(tempSnapshots);
+        for (const snapFile of snapshotFiles.slice(0, 5)) {
+          const snapPath = path.join(tempSnapshots, snapFile);
+          files.push(new AttachmentBuilder(fs.readFileSync(snapPath))
+            .setName(snapFile.endsWith('.txt') ? snapFile : snapFile + '.txt')
+            .setDescription(`Snapshot: ${snapFile}`));
+        }
+        
+        // Cleanup snapshots
+        fs.rmSync(tempSnapshots, { recursive: true, force: true });
+      }
+
+      if (stdout.includes('[DynamicTrace]')) {
+        const traceMatch = stdout.match(/\[DynamicTrace\] replayed (\d+) calls/);
+        if (traceMatch) {
+          resultEmbed.addFields({ name: 'Dynamic Calls Replayed', value: traceMatch[1], inline: true });
+        }
+      }
+
+      resultEmbed.addFields({ name: 'Output', value: stdout.replace(/\[.*?\]/g, '').trim().substring(0, 500) });
+
+      try {
+        await loadingMsg.edit({ embeds: [resultEmbed], files: files.length > 0 ? files : [] });
+      } catch (e) {
+        if (e instanceof DiscordAPIError && e.code === 50006) {
+          await loadingMsg.edit({ content: 'Deobfuscation complete! (Empty output)', embeds: [resultEmbed] });
+        } else {
+          throw e;
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Deobfuscation error:', error);
+    msg.reply(`Error: ${error.message}`);
+  }
+}
+
+
+// Anti-debugger protection code to prepend before obfuscation
+async function handleObfuscation(msg, inputCode, preset) {
+  // Use system temp directory instead of project temp folder
+  const tempDir = require('os').tmpdir();
+  const tempInput = path.join(tempDir, `input_${msg.id}_${Date.now()}.lua`);
+  const tempOutput = path.join(tempDir, `output_${msg.id}_${Date.now()}.obfuscated.lua`);
+  
+
+  // Check if user has MOD or OWNER role (unlimited credits, no rate limit)
+  const isElevated = await hasElevatedRole(msg);
+
+  try {
+    fs.writeFileSync(tempInput, inputCode);
+
+    const loadingMsg = isElevated 
+      ? await msg.reply(`Obfuscating with \`${preset}\` preset... (MOD/OWNER - Unlimited)`)
+      : await msg.reply(`Obfuscating with \`${preset}\` preset...\n(msg.author.id)})`);
+
+    runObfuscator(tempInput, preset, async (exitCode, stdout, stderr, outputPath) => {
+      // Cleanup input
+      try { fs.unlinkSync(tempInput); } catch (e) {}
+
+      if (exitCode !== 0 || !fs.existsSync(outputPath)) {
+        await loadingMsg.edit(`Error running obfuscator!\n\`\`\`\n${stderr || stdout}\n\`\`\``);
+        return;
+      }
+
+      try {
+        const outputCode = fs.readFileSync(outputPath, 'utf8');
+        
+        // Cleanup output
+        try { fs.unlinkSync(outputPath); } catch (e) {}
+
+        
+        
+        const resultEmbed = new EmbedBuilder();
+        resultEmbed.setTitle('**Obfuscation Complete**');
+        resultEmbed.setColor(0x00ff00);
+        resultEmbed.addFields(
+          { name: 'Preset', value: `\`${preset}\``, inline: true },
+          { name: 'Original Lines', value: inputCode.split('\n').length.toString(), inline: true },
+          { name: 'Obfuscated Lines', value: outputCode.split('\n').length.toString(), inline: true }
+        );
+
+        await loadingMsg.edit({
+          embeds: [resultEmbed],
+          files: [new AttachmentBuilder(Buffer.from(outputCode, 'utf8'))
+            .setName('obfuscated.txt')
+            .setDescription('Obfuscated Lua code')]
+        });
+      } catch (e) {
+        await loadingMsg.edit(`Error reading output: ${e.message}`);
+      }
+    });
+  } catch (error) {
+    console.error('Obfuscation error:', error);
+    msg.reply(`Error: ${error.message}`);
+  }
+}
+
+// Handle obfuscation with extra obfuscation layers (for obf2 command)
+async function handleObfuscationWithExtra(msg, inputCode, preset) {
+  const tempDir = require('os').tmpdir();
+  const tempInput = path.join(tempDir, `input_${msg.id}_${Date.now()}.lua`);
+  const tempOutput = path.join(tempDir, `output_${msg.id}_${Date.now()}.obfuscated.lua`);
+  
+  const isElevated = await hasElevatedRole(msg);
+
+  try {
+    fs.writeFileSync(tempInput, inputCode);
+
+    const loadingMsg = isElevated 
+      ? await msg.reply(`Obfuscating with \`${preset}\` preset + Extra Protection... (MOD/OWNER - Unlimited)`)
+      : await msg.reply(`Obfuscating with \`${preset}\` preset + Extra Protection...`);
+
+    runObfuscator(tempInput, preset, async (exitCode, stdout, stderr, outputPath) => {
+      try { fs.unlinkSync(tempInput); } catch (e) {}
+
+      if (exitCode !== 0 || !fs.existsSync(outputPath)) {
+        await loadingMsg.edit(`Error running obfuscator!\n\`\`\`\n${stderr || stdout}\n\`\`\``);
+        return;
+      }
+
+      try {
+        let outputCode = fs.readFileSync(outputPath, 'utf8');
+        try { fs.unlinkSync(outputPath); } catch (e) {}
+
+        outputCode = applyExtraObfuscation(outputCode);
+        
+        const resultEmbed = new EmbedBuilder();
+        resultEmbed.setTitle('**Obfuscation Complete**');
+        resultEmbed.setColor(0x00ff00);
+        resultEmbed.addFields(
+          { name: 'Preset', value: `\`${preset}\` + Extra`, inline: true },
+          { name: 'Original Lines', value: inputCode.split('\n').length.toString(), inline: true },
+          { name: 'Obfuscated Lines', value: outputCode.split('\n').length.toString(), inline: true },
+          { name: 'Extra Protection', value: '✅ Enabled', inline: true }
+        );
+
+        await loadingMsg.edit({
+          embeds: [resultEmbed],
+          files: [new AttachmentBuilder(Buffer.from(outputCode, 'utf8'))
+            .setName('obfuscated.txt')
+            .setDescription('Obfuscated Lua code')]
+        });
+      } catch (e) {
+        await loadingMsg.edit(`Error reading output: ${e.message}`);
+      }
+    });
+  } catch (error) {
+    console.error('Obfuscation error:', error);
+    msg.reply(`Error: ${error.message}`);
+  }
+}
+
+// Roblox-compatible Lua obfuscator
+function applyExtraObfuscation(code) {
+  // Hex encode the Lua code
+  const hexEncode = (str) => {
+    let out = "";
+    for (let i = 0; i < str.length; i++) {
+      out += str.charCodeAt(i).toString(16).padStart(2, "0");
+    }
+    return out;
+  };
+
+  const encoded = hexEncode(code);
+
+  // Split into random chunks
+  const chunks = [];
+  let i = 0;
+  while (i < encoded.length) {
+    const size = Math.floor(Math.random() * 40) + 20; // 20-60 chars per chunk
+    chunks.push(encoded.slice(i, i + size));
+    i += size;
+  }
+
+  const chunkTable = chunks.map(c => `"${c}"`).join(",");
+
+  // Variable names inside loader
+  const payloadVar = "p";
+  const bufferVar = "b";
+  const resultVar = "r";
+  const indexVar = "i";
+  const byteVar = "c";
+
+  // Return loader code without varargs
+  const loader = `
+do
+  local ${payloadVar} = {${chunkTable}}
+  local ${bufferVar} = table.concat(${payloadVar})
+  local ${resultVar} = {}
+  for ${indexVar} = 1, #${bufferVar}, 2 do
+    ${byteVar} = tonumber(${bufferVar}:sub(${indexVar}, ${indexVar}+1), 16)
+    ${resultVar}[#${resultVar}+1] = string.char(${byteVar})
+  end
+  local f = loadstring(table.concat(${resultVar}))
+  if f then
+    return f()
+  end
+end
+`;
+
+  return loader;
+}
+
+module.exports = { applyExtraObfuscation };

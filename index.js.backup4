@@ -1,0 +1,771 @@
+const {
+  Client,
+  GatewayIntentBits,
+  AttachmentBuilder,
+  EmbedBuilder,
+  Partials
+} = require('discord.js');
+
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+require('dotenv').config();
+const db = require('./database');
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages
+  ],
+  partials: [Partials.Channel]
+});
+
+const PREFIX = process.env.BOT_PREFIX || '.';
+const LUA_PATH = process.env.LUA_PATH || 'lua';
+
+const OBF_DIR = path.join(__dirname, 'Prometheus-discord-bot', 'lua');
+
+// Size constants
+const MIN_OBFUSCATED_SIZE = 25 * 1024; // 25KB minimum
+const MAX_OBFUSCATED_SIZE = 6 * 1024 * 1024; // 6MB maximum
+const TARGET_SIZE_MULTIPLIER = 50; // Target output size = input size * 50 for heavy obfuscation
+
+function isDM(msg) {
+  return msg.channel.isDMBased();
+}
+
+async function safeReply(msg, content) {
+  try {
+    if (isDM(msg)) {
+      return await msg.channel.send(content);
+    } else {
+      return await msg.reply(content);
+    }
+  } catch (e) {
+    console.error('Reply error:', e);
+    return await msg.channel.send(content);
+  }
+}
+
+async function safeReplyWithFiles(msg, options) {
+  try {
+    if (isDM(msg)) {
+      return await msg.channel.send(options);
+    } else {
+      return await msg.reply(options);
+    }
+  } catch (e) {
+    console.error('Reply error:', e);
+    return await msg.channel.send(options);
+  }
+}
+
+// Generate a custom config based on target size
+function generateCustomConfig(inputSize, targetSize) {
+  const config = {
+    LuaVersion: "Lua51",
+    VarNamePrefix: "",
+    NameGenerator: "MangledShuffled",
+    PrettyPrint: false,
+    Seed: 0,
+    Steps: []
+  };
+
+  // Calculate how many passes needed based on target size
+  const sizeRatio = targetSize / Math.max(inputSize, 1);
+  
+  // Add multiple Vmify passes (creates VM code - very large output)
+  const vmifyPasses = Math.min(Math.ceil(sizeRatio / 10), 10);
+  for (let i = 0; i < vmifyPasses; i++) {
+    config.Steps.push({
+      Name: "Vmify",
+      Settings: {}
+    });
+  }
+
+  // Add encryption steps
+  config.Steps.push({
+    Name: "EncryptStrings",
+    Settings: {}
+  });
+
+  // Add anti-tamper
+  config.Steps.push({
+    Name: "AntiTamper",
+    Settings: {
+      UseDebug: false
+    }
+  });
+
+  // Add more Vmify
+  config.Steps.push({
+    Name: "Vmify",
+    Settings: {}
+  });
+
+  // Add constant array with aggressive settings
+  config.Steps.push({
+    Name: "ConstantArray",
+    Settings: {
+      Treshold: 1,
+      StringsOnly: false,
+      Shuffle: true,
+      Rotate: true,
+      LocalWrapperTreshold: 0
+    }
+  });
+
+  // Add numbers to expressions
+  config.Steps.push({
+    Name: "NumbersToExpressions",
+    Settings: {}
+  });
+
+  // Add wrap in function
+  config.Steps.push({
+    Name: "WrapInFunction",
+    Settings: {}
+  });
+
+  // Add split strings for more obfuscation
+  config.Steps.push({
+    Name: "SplitStrings",
+    Settings: {
+      MinLength: 1,
+      MaxLength: 3
+    }
+  });
+
+  // Add proxify locals
+  config.Steps.push({
+    Name: "ProxifyLocals",
+    Settings: {}
+  });
+
+  // Final Vmify pass
+  config.Steps.push({
+    Name: "Vmify",
+    Settings: {}
+  });
+
+  return config;
+}
+
+// Run obfuscator with custom config
+function runObfuscatorWithConfig(inputPath, config, callback) {
+  const outputPath = inputPath.replace('.lua', '.obfuscated.lua');
+  
+  // Write config to temp file
+  const configPath = inputPath.replace('.lua', '.config.lua');
+  const configContent = 'return ' + JSON.stringify(config, null, 2)
+    .replace(/"([^"]+)":/g, '$1 =')
+    .replace(/"/g, '');
+  
+  fs.writeFileSync(configPath, configContent);
+
+  const args = [
+    path.join(OBF_DIR, 'cli.lua'),
+    '--config', configPath,
+    '--LuaU',
+    inputPath,
+    '--out', outputPath
+  ];
+
+  console.log('Running obfuscator with custom config:', LUA_PATH, args.join(' '));
+
+  const lua = spawn(LUA_PATH, args, {
+    cwd: OBF_DIR,
+    env: { ...process.env, LUA_PATH: `${OBF_DIR}/?.lua;${process.env.LUA_PATH || ''}` },
+  });
+
+  let stdout = '';
+  let stderr = '';
+
+  lua.stdout.on('data', (data) => {
+    stdout += data.toString();
+  });
+
+  lua.stderr.on('data', (data) => {
+    stderr += data.toString();
+  });
+
+  lua.on('close', (code) => {
+    // Cleanup config file
+    try { fs.unlinkSync(configPath); } catch (e) {}
+    callback(code, stdout, stderr, outputPath);
+  });
+}
+
+// Run standard obfuscator
+function runObfuscator(inputPath, preset, callback) {
+  const outputPath = inputPath.replace('.lua', '.obfuscated.lua');
+  const capitalizedPreset = preset.charAt(0).toUpperCase() + preset.slice(1).toLowerCase();
+  const args = [path.join(OBF_DIR, 'cli.lua'), '--preset', capitalizedPreset, '--LuaU', inputPath, '--out', outputPath];
+
+  console.log('Running obfuscator:', LUA_PATH, args.join(' '));
+
+  const lua = spawn(LUA_PATH, args, {
+    cwd: OBF_DIR,
+    env: { ...process.env, LUA_PATH: `${OBF_DIR}/?.lua;${process.env.LUA_PATH || ''}` },
+  });
+
+  let stdout = '';
+  let stderr = '';
+
+  lua.stdout.on('data', (data) => {
+    stdout += data.toString();
+  });
+
+  lua.stderr.on('data', (data) => {
+    stderr += data.toString();
+  });
+
+  lua.on('close', (code) => {
+    callback(code, stdout, stderr, outputPath);
+  });
+}
+
+function extractCodeFromMessage(content) {
+  const codeBlock = content.match(/```(?:\w+)?\s*([\s\S]*?)```/);
+  if (codeBlock) return codeBlock[1].trim();
+  const inline = content.match(/`([^`]+)`/);
+  if (inline) return inline[1].trim();
+  return null;
+}
+
+function getAttachedLua(msg) {
+  if (msg.attachments.size > 0) {
+    for (const [, attachment] of msg.attachments) {
+      if (attachment.name) {
+        return { url: attachment.url, name: attachment.name };
+      }
+    }
+  }
+  return null;
+}
+
+async function sendTextAsFile(msg, content, fileName = 'response.txt') {
+  const file = new AttachmentBuilder(Buffer.from(content, 'utf8'))
+    .setName(fileName);
+
+  return safeReplyWithFiles(msg, { files: [file] });
+}
+
+function minifyLua(code) {
+  let result = '';
+  let i = 0;
+  let inString = false;
+  let stringChar = '';
+  let escapeNext = false;
+  
+  while (i < code.length) {
+    const char = code[i];
+    
+    if (escapeNext) {
+      result += char;
+      escapeNext = false;
+      i++;
+      continue;
+    }
+    
+    if (char === '\\' && inString) {
+      result += char;
+      escapeNext = true;
+      i++;
+      continue;
+    }
+    
+    if (char === '"' || char === "'") {
+      if (!inString) {
+        inString = true;
+        stringChar = char;
+      } else if (char === stringChar) {
+        inString = false;
+      }
+      result += char;
+      i++;
+      continue;
+    }
+    
+    if (inString) {
+      result += char;
+      i++;
+      continue;
+    }
+    
+    if (char === '-' && code[i + 1] === '-' && code[i + 2] === '[' && code[i + 3] === '[') {
+      const endMatch = code.substring(i).match(/^\-\[\[([\s\S]*?)\]\]/);
+      if (endMatch) {
+        i += endMatch[0].length;
+        continue;
+      }
+    }
+    
+    if (char === '-' && code[i + 1] === '-') {
+      if (code[i + 2] === '[' && code[i + 3] === '[') {
+        i += 4;
+        let endIdx = code.indexOf(']]', i);
+        if (endIdx !== -1) {
+          i = endIdx + 2;
+          continue;
+        }
+      } else {
+        while (i < code.length && code[i] !== '\n' && code[i] !== '\r') {
+          i++;
+        }
+        continue;
+      }
+    }
+    
+    if (char === ' ' || char === '\t' || char === '\n' || char === '\r') {
+      const nextNonSpace = code.substring(i + 1).match(/^[ \t\n\r]*([a-zA-Z0-9_\(\[\{])/);
+      if (nextNonSpace) {
+        const prevChar = result.slice(-1);
+        if (prevChar && prevChar.match(/[a-zA-Z0-9_\)\]\}]/)) {
+          result += ' ';
+        }
+      }
+      while (i < code.length && (code[i] === ' ' || code[i] === '\t' || code[i] === '\n' || code[i] === '\r')) {
+        i++;
+      }
+      continue;
+    }
+    
+    result += char;
+    i++;
+  }
+  
+  return result;
+}
+
+// Check if user has elevated role (MOD or OWNER)
+async function hasElevatedRole(msg) {
+  if (isDM(msg)) return false;
+  
+  try {
+    const member = msg.member;
+    if (!member) return false;
+    
+    const roleNames = member.roles.cache.map(r => r.name.toLowerCase());
+    return roleNames.includes('mod') || roleNames.includes('owner');
+  } catch (e) {
+    console.error('Error checking roles:', e);
+    return false;
+  }
+}
+
+// Heavy obfuscation handler - ensures minimum 25KB output
+async function handleHeavyObfuscation(msg, inputCode) {
+  const tempDir = require('os').tmpdir();
+  const tempInput = path.join(tempDir, `input_${msg.id}_${Date.now()}.lua`);
+  
+  const isElevated = await hasElevatedRole(msg);
+  const inputSize = Buffer.byteLength(inputCode, 'utf8');
+  
+  // Calculate target size - at least 25KB or inputSize * 50, whichever is larger
+  // But cap at 6MB
+  let targetSize = Math.max(MIN_OBFUSCATED_SIZE, inputSize * TARGET_SIZE_MULTIPLIER);
+  targetSize = Math.min(targetSize, MAX_OBFUSCATED_SIZE);
+
+  try {
+    fs.writeFileSync(tempInput, inputCode);
+
+    const loadingMsg = isElevated 
+      ? await msg.reply(`Heavy obfuscation - Target: ${(targetSize/1024).toFixed(0)}KB... (MOD/OWNER)`)
+      : await msg.reply(`Heavy obfuscation - Target: ${(targetSize/1024).toFixed(0)}KB...`);
+
+    // Generate custom config based on input size
+    const config = generateCustomConfig(inputSize, targetSize);
+    
+    // Run obfuscation with custom config
+    runObfuscatorWithConfig(tempInput, config, async (exitCode, stdout, stderr, outputPath) => {
+      try { fs.unlinkSync(tempInput); } catch (e) {}
+
+      if (exitCode !== 0 || !fs.existsSync(outputPath)) {
+        await loadingMsg.edit(`Error running obfuscator!\n\`\`\`\n${stderr || stdout}\n\`\`\``);
+        return;
+      }
+
+      try {
+        let outputCode = fs.readFileSync(outputPath, 'utf8');
+        let outputSize = Buffer.byteLength(outputCode, 'utf8');
+        
+        // If still not enough size, iterate with more aggressive config
+        let iterations = 0;
+        const maxIterations = 5;
+        
+        while (outputSize < MIN_OBFUSCATED_SIZE && iterations < maxIterations) {
+          console.log(`Iteration ${iterations + 1}: Output size ${outputSize} bytes, need more...`);
+          
+          // Write current output as input for next pass
+          fs.writeFileSync(tempInput, outputCode);
+          
+          // Make config even more aggressive
+          const aggressiveConfig = generateCustomConfig(outputSize, targetSize * 1.5);
+          
+          await new Promise((resolve) => {
+            runObfuscatorWithConfig(tempInput, aggressiveConfig, (code, out, err, outPath) => {
+              if (code === 0 && fs.existsSync(outPath)) {
+                outputCode = fs.readFileSync(outPath, 'utf8');
+                outputSize = Buffer.byteLength(outputCode, 'utf8');
+                try { fs.unlinkSync(outPath); } catch (e) {}
+              }
+              resolve();
+            });
+          });
+          
+          iterations++;
+        }
+        
+        try { fs.unlinkSync(outputPath); } catch (e) {}
+
+        await loadingMsg.edit({
+          content: `Obfuscation complete!\nOriginal Size: ${inputSize} bytes\nObfuscated Size: ${outputSize} bytes (${(outputSize/1024).toFixed(2)} KB)`,
+          files: [new AttachmentBuilder(Buffer.from(outputCode, 'utf8'))
+            .setName('obfuscated.lua')
+            .setDescription('Obfuscated Lua code')]
+        });
+        
+        // Track obfuscation usage
+        db.recordObfuscation(msg.author.id, isDM(msg));
+      } catch (e) {
+        await loadingMsg.edit(`Error reading output: ${e.message}`);
+      }
+    });
+  } catch (error) {
+    console.error('Obfuscation error:', error);
+    msg.reply(`Error: ${error.message}`);
+  }
+}
+
+// Standard obfuscation handler
+async function handleObfuscation(msg, inputCode, preset) {
+  const tempDir = require('os').tmpdir();
+  const tempInput = path.join(tempDir, `input_${msg.id}_${Date.now()}.lua`);
+  const tempOutput = path.join(tempDir, `output_${msg.id}_${Date.now()}.obfuscated.lua`);
+
+  const isElevated = await hasElevatedRole(msg);
+
+  try {
+    fs.writeFileSync(tempInput, inputCode);
+
+    const loadingMsg = isElevated 
+      ? await msg.reply(`Obfuscating with \`${preset}\` preset... (MOD/OWNER - Unlimited)`)
+      : await msg.reply(`Obfuscating with \`${preset}\` preset...`);
+
+    runObfuscator(tempInput, preset, async (exitCode, stdout, stderr, outputPath) => {
+      try { fs.unlinkSync(tempInput); } catch (e) {}
+
+      if (exitCode !== 0 || !fs.existsSync(outputPath)) {
+        await loadingMsg.edit(`Error running obfuscator!\n\`\`\`\n${stderr || stdout}\n\`\`\``);
+        return;
+      }
+
+      try {
+        const outputCode = fs.readFileSync(outputPath, 'utf8');
+        try { fs.unlinkSync(outputPath); } catch (e) {}
+
+        await loadingMsg.edit({
+          content: `Obfuscation complete! Preset: ${preset}\nOriginal Lines: ${inputCode.split('\n').length}\nObfuscated Lines: ${outputCode.split('\n').length}`,
+          files: [new AttachmentBuilder(Buffer.from(outputCode, 'utf8'))
+            .setName('obfuscated.txt')
+            .setDescription('Obfuscated Lua code')]
+        });
+
+        // Track obfuscation usage
+        db.recordObfuscation(msg.author.id, isDM(msg));
+      } catch (e) {
+        await loadingMsg.edit(`Error reading output: ${e.message}`);
+      }
+    });
+  } catch (error) {
+    console.error('Obfuscation error:', error);
+    msg.reply(`Error: ${error.message}`);
+  }
+}
+
+// Extra obfuscation handler
+async function handleObfuscationWithExtra(msg, inputCode, preset) {
+  const tempDir = require('os').tmpdir();
+  const tempInput = path.join(tempDir, `input_${msg.id}_${Date.now()}.lua`);
+  const tempOutput = path.join(tempDir, `output_${msg.id}_${Date.now()}.obfuscated.lua`);
+  
+  const isElevated = await hasElevatedRole(msg);
+
+  try {
+    fs.writeFileSync(tempInput, inputCode);
+
+    const loadingMsg = isElevated 
+      ? await msg.reply(`Obfuscating with \`${preset}\` preset + Extra Protection... (MOD/OWNER - Unlimited)`)
+      : await msg.reply(`Obfuscating with \`${preset}\` preset + Extra Protection...`);
+
+    runObfuscator(tempInput, preset, async (exitCode, stdout, stderr, outputPath) => {
+      try { fs.unlinkSync(tempInput); } catch (e) {}
+
+      if (exitCode !== 0 || !fs.existsSync(outputPath)) {
+        await loadingMsg.edit(`Error running obfuscator!\n\`\`\`\n${stderr || stdout}\n\`\`\``);
+        return;
+      }
+
+      try {
+        let outputCode = fs.readFileSync(outputPath, 'utf8');
+        try { fs.unlinkSync(outputPath); } catch (e) {}
+
+        outputCode = applyExtraObfuscation(outputCode);
+        
+        await loadingMsg.edit({
+          content: `Obfuscation complete! Preset: ${preset} + Extra\nOriginal Lines: ${inputCode.split('\n').length}\nObfuscated Lines: ${outputCode.split('\n').length}\nExtra Protection: ✅ Enabled`,
+          files: [new AttachmentBuilder(Buffer.from(outputCode, 'utf8'))
+            .setName('obfuscated.txt')
+            .setDescription('Obfuscated Lua code')]
+        });
+
+        // Track obfuscation usage
+        db.recordObfuscation(msg.author.id, isDM(msg));
+      } catch (e) {
+        await loadingMsg.edit(`Error reading output: ${e.message}`);
+      }
+    });
+  } catch (error) {
+    console.error('Obfuscation error:', error);
+    msg.reply(`Error: ${error.message}`);
+  }
+}
+
+// Roblox-compatible Lua obfuscator
+function applyExtraObfuscation(code) {
+  const hexEncode = (str) => {
+    let out = "";
+    for (let i = 0; i < str.length; i++) {
+      out += str.charCodeAt(i).toString(16).padStart(2, "0");
+    }
+    return out;
+  };
+
+  const encoded = hexEncode(code);
+
+  const chunks = [];
+  let i = 0;
+  while (i < encoded.length) {
+    const size = Math.floor(Math.random() * 40) + 20;
+    chunks.push(encoded.slice(i, i + size));
+    i += size;
+  }
+
+  const chunkTable = chunks.map(c => `"${c}"`).join(",");
+
+  const payloadVar = "p";
+  const bufferVar = "b";
+  const resultVar = "r";
+  const indexVar = "i";
+  const byteVar = "c";
+
+  const loader = `
+do
+  local ${payloadVar} = {${chunkTable}}
+  local ${bufferVar} = table.concat(${payloadVar})
+  local ${resultVar} = {}
+  for ${indexVar} = 1, #${bufferVar}, 2 do
+    ${byteVar} = tonumber(${bufferVar}:sub(${indexVar}, ${indexVar}+1), 16)
+    ${resultVar}[#${resultVar}+1] = string.char(${byteVar})
+  end
+  local f = loadstring(table.concat(${resultVar}))
+  if f then
+    return f()
+  end
+end
+`;
+
+  return loader;
+}
+
+client.on('ready', () => {
+  console.log(`Bot logged in as ${client.user.tag}`);
+  // Start session tracking when bot comes online
+  db.startSession();
+});
+
+// Track when bot disconnects to save uptime
+client.on('disconnect', () => {
+  const stats = db.getStats();
+  if (stats.currentSessionStart) {
+    const sessionDuration = Date.now() - stats.currentSessionStart;
+    stats.totalUptime = (stats.totalUptime || 0) + sessionDuration;
+    stats.currentSessionStart = null;
+    db.saveStats(stats);
+    console.log(`[Database] Session ended. Duration: ${db.formatUptime(sessionDuration)}`);
+  }
+});
+
+client.on('messageCreate', async (msg) => {
+  if (msg.author.bot) return;
+
+  let content = msg.content.trim();
+
+  if (!isDM(msg) && !content.startsWith(PREFIX)) return;
+
+  if (content.startsWith(PREFIX)) {
+    content = content.slice(PREFIX.length);
+  }
+
+  const args = content.split(/\s+/);
+  const command = args.shift()?.toLowerCase();
+  const attached = getAttachedLua(msg);
+
+  switch (command) {
+  case 'help': {
+    const helpMessage = 
+`**Commands:**
+\`\`\`ansi
+\u001b[1;35m.help\u001b[0m\u001b[1;9m -> \u001b[0m\u001b[1;33mDisplays help message.\u001b[0m
+\u001b[1;35m.ping\u001b[0m\u001b[1;9m -> \u001b[0m\u001b[1;33mBot latency.\u001b[0m
+\u001b[1;35m.stats\u001b[0m\u001b[1;9m -> \u001b[0m\u001b[1;33mBot statistics.\u001b[0m
+\u001b[1;35m.obf\u001b[0m\u001b[1;9m -> \u001b[0m\u001b[1;33mStandard obfuscation.\u001b[0m
+\u001b[1;35m.obf2\u001b[0m\u001b[1;9m -> \u001b[0m\u001b[1;33mObfuscation + Extra Protection.\u001b[0m
+\u001b[1;35m.obfheavy\u001b[0m\u001b[1;9m -> \u001b[0m\u001b[1;33mHeavy obfuscation (25KB+ min).\u001b[0m
+\u001b[1;35m.minify\u001b[0m\u001b[1;9m -> \u001b[0m\u001b[1;33mMinify Lua Scripts.\u001b[0m
+\u001b[1;35m.get\u001b[0m\u001b[1;9m -> \u001b[0m\u001b[1;33mFetch Content From URL.\u001b[0m
+\`\`\``;
+
+    await safeReply(msg, helpMessage);
+    break;
+  }
+
+    case 'obf': {
+      const presetMap = { 'weak': 'Weak', 'medium': 'Medium', 'strong': 'Strong' };
+      let preset = 'Weak';
+      
+      if (args[0] && presetMap[args[0].toLowerCase()]) {
+        preset = presetMap[args[0].toLowerCase()];
+      }
+
+      const code = extractCodeFromMessage(msg.content);
+      if (code) {
+        return handleObfuscation(msg, code, preset);
+      } else if (attached) {
+        const res = await fetch(attached.url);
+        const buffer = Buffer.from(await res.arrayBuffer());
+        return handleObfuscation(msg, buffer.toString('utf8'), preset);
+      } else {
+        return safeReply(msg, 'Provide Lua code in a codeblock or attach a file.');
+      }
+    }
+
+    case 'obf2': {
+      const presetMap = { 'weak': 'Weak', 'medium': 'Medium', 'strong': 'Strong' };
+      let preset = 'Weak';
+      
+      if (args[0] && presetMap[args[0].toLowerCase()]) {
+        preset = presetMap[args[0].toLowerCase()];
+      }
+
+      const code = extractCodeFromMessage(msg.content);
+      if (code) {
+        return handleObfuscationWithExtra(msg, code, preset);
+      } else if (attached) {
+        const res = await fetch(attached.url);
+        const buffer = Buffer.from(await res.arrayBuffer());
+        return handleObfuscationWithExtra(msg, buffer.toString('utf8'), preset);
+      } else {
+        return safeReply(msg, 'Provide Lua code in a codeblock or attach a file.');
+      }
+    }
+
+    case 'obfheavy': {
+      const code = extractCodeFromMessage(msg.content);
+      if (code) {
+        return handleHeavyObfuscation(msg, code);
+      } else if (attached) {
+        const res = await fetch(attached.url);
+        const buffer = Buffer.from(await res.arrayBuffer());
+        return handleHeavyObfuscation(msg, buffer.toString('utf8'));
+      } else {
+        return safeReply(msg, 'Provide Lua code in a codeblock or attach a file.');
+      }
+    }
+
+    case 'minify': {
+      const codeFromBlock = extractCodeFromMessage(msg.content);
+      
+      if (codeFromBlock) {
+        const minified = minifyLua(codeFromBlock);
+        const originalSize = codeFromBlock.length;
+        const minifiedSize = minified.length;
+        
+        await safeReply(msg, `Minification complete! Original: ${originalSize} chars, Minified: ${minifiedSize} chars`);
+        return sendTextAsFile(msg, minified, 'minified.lua');
+      } else if (attached) {
+        try {
+          const res = await fetch(attached.url);
+          const buffer = Buffer.from(await res.arrayBuffer());
+          const codeString = buffer.toString('utf8');
+          
+          const minified = minifyLua(codeString);
+          const originalSize = codeString.length;
+          const minifiedSize = minified.length;
+          
+          await safeReply(msg, `Minification complete! Original: ${originalSize} chars, Minified: ${minifiedSize} chars`);
+          return sendTextAsFile(msg, minified, 'minified.lua');
+        } catch (e) {
+          return safeReply(msg, `Could not download attached file: ${e.message}`);
+        }
+      } else {
+        return safeReply(msg, 'Provide Lua code in a codeblock or attach a file.');
+      }
+    }
+
+    case 'get': {
+      const url = args[0];
+      if (!url) return safeReply(msg, 'Usage: .get <url>');
+
+      try {
+        new URL(url);
+      } catch {
+        return safeReply(msg, 'Invalid URL.');
+      }
+
+      const loadingMsg = await safeReply(msg, 'Fetching...');
+      const res = await fetch(url);
+
+      if (!res.ok) {
+        return loadingMsg.edit(`HTTP ${res.status}`);
+      }
+
+      const text = await res.text();
+      await sendTextAsFile(msg, text, 'fetched.txt');
+      return loadingMsg.delete();
+    }
+
+    case 'ping': {
+      const sent = await msg.reply('Pinging...');
+      const ping = sent.createdTimestamp - msg.createdTimestamp;
+      await sent.edit(`Pong! ${ping}ms`);
+      break;
+    }
+
+    case 'stats': {
+      const stats = db.getStats();
+      const uniqueUsers = db.getUniqueUserCount();
+      const uptime = db.getUptime(stats.startTime);
+      
+      const totalLocations = stats.dms + stats.servers;
+      const dmPercent = totalLocations > 0 ? ((stats.dms / totalLocations) * 100).toFixed(1) : 0;
+      const serverPercent = totalLocations > 0 ? ((stats.servers / totalLocations) * 100).toFixed(1) : 0;
+
+      await safeReply(msg, `Bot Statistics
+Uptime: ${uptime}
+Scripts Obfuscated: ${stats.obfuscations}
+Unique Users: ${uniqueUsers}
+DM Usage: ${stats.dms} (${dmPercent}%)
+Server Usage: ${stats.servers} (${serverPercent}%)`);
+      break;
+    }
+
+    default:
+      return safeReply(msg, `Unknown command: ${command}\nUse ${PREFIX}help for available commands.`);
+  }
+});
+
+client.login(process.env.DISCORD_TOKEN);
